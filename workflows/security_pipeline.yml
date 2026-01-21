@@ -1,0 +1,81 @@
+name: TCC Security Pipeline - Defense in Depth
+
+on: [push]
+
+jobs:
+  ssl-pinning-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 1. Baixar Código
+      uses: actions/checkout@v3
+
+    - name: 2. Configurar Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: 3. Gerar Certificados (PKI Simulada)
+      run: |
+        # Gera o certificado LEGITIMO (Servidor Correto)
+        openssl req -x509 -newkey rsa:2048 -keyout key_legit.pem -out cert_legit.pem -days 1 -nodes -subj "/CN=localhost"
+        
+        # Gera o certificado ATACANTE (Servidor MitM)
+        openssl req -x509 -newkey rsa:2048 -keyout key_evil.pem -out cert_evil.pem -days 1 -nodes -subj "/CN=localhost"
+        
+        echo "Certificados gerados."
+
+    - name: 4. Calcular o PIN Correto
+      id: calc_pin
+      run: |
+        # Vamos usar nosso próprio script para calcular o hash do arquivo gerado
+        # Isso simula o desenvolvedor pegando o hash antes de configurar o app
+        
+        # Sobe um servidor temporário rapidinho só para extrair o hash via script ou usa openssl direto
+        # Aqui vamos usar openssl para pegar o fingerprint SHA256 de forma limpa
+        PIN=$(openssl x509 -in cert_legit.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 | awk '{print $2}')
+        
+        echo "O PIN LEGITIMO É: $PIN"
+        echo "PIN_HASH=$PIN" >> $GITHUB_ENV
+
+    - name: 5. Teste de Sucesso (Conexão Legitima)
+      run: |
+        echo "--- INICIANDO SERVIDOR LEGITIMO ---"
+        # Usamos o script do MitM mas apontando para o certificado LEGITIMO apenas para simular o server
+        # (Truque para não ter que criar 2 scripts de server)
+        sed -i 's/cert_evil.pem/cert_legit.pem/g' scripts/simulate_mitm_attack.py
+        sed -i 's/key_evil.pem/key_legit.pem/g' scripts/simulate_mitm_attack.py
+        
+        python scripts/simulate_mitm_attack.py &
+        PID_SERVER=$!
+        sleep 3
+        
+        echo "--- TESTANDO CONEXÃO COM PIN CORRETO ---"
+        # Aqui o cliente tem o PIN correto. Deve conectar (Exit code 0).
+        python scripts/verify_pinning.py --url https://localhost --port 4443 --pin ${{ env.PIN_HASH }}
+        
+        kill $PID_SERVER
+        # Desfaz as mudanças no script para o próximo passo
+        git checkout scripts/simulate_mitm_attack.py
+
+    - name: 6. Teste de Ataque (MitM)
+      continue-on-error: true  # Isso é importante! Se falhar (como deve), o GitHub não marca como erro vermelho.
+      run: |
+        echo "--- INICIANDO SERVIDOR ATACANTE (MitM) ---"
+        # Agora roda o script original que usa key_evil.pem
+        python scripts/simulate_mitm_attack.py &
+        PID_SERVER=$!
+        sleep 3
+        
+        echo "--- CLIENTE TENTANDO CONECTAR (Esperando falha) ---"
+        # O cliente ainda espera o PIN LEGITIMO, mas o servidor entrega o EVIL.
+        # O script deve retornar erro (Exit 1).
+        if ! python scripts/verify_pinning.py --url https://localhost --port 4443 --pin ${{ env.PIN_HASH }}; then
+             echo "SUCESSO: O ataque foi bloqueado corretamente!"
+             kill $PID_SERVER
+             exit 0
+        else
+             echo "FALHA GRAVE: O cliente aceitou a conexão insegura!"
+             kill $PID_SERVER
+             exit 1
+        fi
